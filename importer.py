@@ -186,13 +186,22 @@ if __name__ == "__main__":
     #print("Initial Marking:", net.initial_marking)
 
     # Try to find an enabled transition
+    is_break = False
     while True:
-        for t in net.transitions:
+        is_break = True
+        transitions = list(net.transitions)
+        import random
+        random.shuffle(transitions)
+        for t in transitions:
             enabled_bs = get_enabled_bindings(net, t)
+            #print(t)
             if enabled_bs:
                 # Fire one
                 print("ENABLED:", t)
                 fire_transition(net, t, enabled_bs[0][1])
                 print("Marking after firing:", net.initial_marking)
+                is_break = False
                 continue
-        break
+        print(is_break)
+        if is_break:
+            break
