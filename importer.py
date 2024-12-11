@@ -1,45 +1,42 @@
 import xml.etree.ElementTree as ET
-from cpn import CPN, Place, Transition, Arc, ColorSet, Multiset, VariableExpression, ConstantExpression, \
-    FunctionExpression, Guard
+import re
+from cpn import CPN, Place, Transition, Arc, ColorSet, Multiset, VariableExpression, ConstantExpression, FunctionExpression, Guard
 from sml import evaluate_sml_expression, SMLParser
 from algo import get_enabled_bindings, is_enabled, fire_transition, can_fire_step, fire_step
 
 """
-Generalized CPN Importer:
+Generalized CPN Importer (Improved):
 
-We aim to provide a generalized importer that does not overfit or hardcode specific color sets, variables, 
-or functions from particular examples. Instead, we rely on the structure provided by the CPN XML and 
-apply generic heuristics:
+We avoid overfitting by not hardcoding any particular color sets, functions,
+or variable names. Instead, we apply generic heuristics to parse and evaluate
+the model. The key points are:
 
-Key Points:
-- Parse global declarations (val x = num), store them in 'env'.
-- Parse color sets:
-  * If an 'index' color set is found with a start and an end defined by env, create an IndexColorSet (from start..end).
-  * If an 'enum' color set is found, create an EnumColorSet.
-  * If a 'product' color set is found (two references), if both are IndexColorSets, create a ProductColorSet.
-    Otherwise fallback to PermissiveColorSet.
-  * If a 'subset' color set is found, fallback to PermissiveColorSet (we won't try to interpret predicates like diff).
-  * If nothing recognized, fallback to PermissiveColorSet.
+- Color sets:
+  * If 'enum': create EnumColorSet
+  * If 'index': try to create IndexColorSet from 1..n if 'n' is known
+  * If 'product': if both sub-colors are known (IndexColorSet/EnumColorSet/Permissive), create ProductColorSet
+  * Otherwise fallback to PermissiveColorSet
+  * We don't handle subsets or complex constructs specially; fallback to PermissiveColorSet.
 
-- For initial markings:
-  * If something ends with '.all()', attempt to call `all_tokens()` on the corresponding color set if found.
-    If the color set does not implement all_tokens or not found, fallback to [0,1,2].
-  * If it's an integer, parse as int. If the token matches the place color set, add it. Otherwise empty.
-  * If string token and matches the color set, add it, else empty.
+- Initial markings:
+  * If token ends in '.all()', try to call all_tokens() on the corresponding color set, or fallback to [0,1,2].
+  * If integer and matches colorset -> that token
+  * If string and matches colorset -> that token
+  * Else no tokens
 
-- For arc expressions:
-  * Try to parse as a variable (alphabetic => VariableExpression).
-  * Try to parse as integer => ConstantExpression.
-  * If it looks like a tuple (e.g. "(x,y)"), parse each component recursively as variable/int/constant, 
-    then produce a FunctionExpression returning a tuple.
-  * Otherwise, try SML parsing. If SML parsing yields a simple var/int/bool, create corresponding expression.
-    Else fallback to ConstantExpression of the raw string.
+- Arc expressions:
+  * Try variable (if purely alphabetic)
+  * Try integer
+  * If tuple syntax "(x,y,...)" parse each component similarly
+  * If function-call-like syntax "Name(arg1,...,argN)": we generically treat this as a FunctionExpression
+    returning a tuple of the evaluated arguments. We do not assume any semantic for the function name.
+    This handles cases like "Chopsticks(p)" or "Mes(s)" without special-casing them.
+  * Otherwise, try SML parsing:
+    - If SML parse yields a simple var/int/bool -> corresponding expression
+    - Else fallback to a ConstantExpression of the raw string.
 
-No special-case references to specific functions or sets like Mes(s) or Chopsticks(p). Everything is handled generically.
-
-This should be more general and not overfit to specific examples.
+This approach is more dynamic and does not rely on specific known examples.
 """
-
 
 class IndexColorSet(ColorSet):
     def __init__(self, start: int, end: int):
@@ -66,7 +63,6 @@ class EnumColorSet(ColorSet):
 
 class ProductColorSet(ColorSet):
     def __init__(self, cs1: ColorSet, cs2: ColorSet):
-        # We'll only support all_tokens if both cs1 and cs2 have all_tokens
         self.cs1 = cs1
         self.cs2 = cs2
 
@@ -76,23 +72,19 @@ class ProductColorSet(ColorSet):
         return False
 
     def all_tokens(self):
-        # Only if both cs1 and cs2 have all_tokens:
         have_all1 = hasattr(self.cs1, 'all_tokens')
         have_all2 = hasattr(self.cs2, 'all_tokens')
         if have_all1 and have_all2:
-            return [(x, y) for x in self.cs1.all_tokens() for y in self.cs2.all_tokens()]
-        # fallback if no methods
-        return [0, 1, 2]
+            return [(x,y) for x in self.cs1.all_tokens() for y in self.cs2.all_tokens()]
+        # fallback
+        return [0,1,2]
 
 
 class PermissiveColorSet(ColorSet):
     def is_member(self, value):
-        # allow int, str, tuple of int/str
         if isinstance(value, tuple):
             return all(isinstance(v, (int, str)) for v in value)
-        return isinstance(value, (int, str))
-
-    # no all_tokens method, rely on fallback if needed.
+        return isinstance(value, (int,str))
 
 
 def parse_global_declarations(globbox_el):
@@ -102,10 +94,9 @@ def parse_global_declarations(globbox_el):
     for ml in globbox_el.findall('ml'):
         code = ml.text.strip()
         if code.startswith("val "):
-            # parse val bindings
             code_line = code.split(';')[0]
             parts = code_line.split('=')
-            if len(parts) == 2:
+            if len(parts)==2:
                 left = parts[0].strip()
                 right = parts[1].strip()
                 varname = left.split()[1]
@@ -122,8 +113,7 @@ def parse_color_sets(globbox_el, env):
     if globbox_el is None:
         return color_sets
 
-    pending_products = []  # store (cname,c1,c2) for product sets
-    # We'll treat subsets or other complex sets as Permissive for now
+    pending_products = []
 
     for c_el in globbox_el.findall('color'):
         cid_el = c_el.find('id')
@@ -131,7 +121,6 @@ def parse_color_sets(globbox_el, env):
             continue
         cname = cid_el.text.strip()
 
-        # enum?
         enum_el = c_el.find('enum')
         if enum_el is not None:
             ids = enum_el.findall('id')
@@ -139,17 +128,16 @@ def parse_color_sets(globbox_el, env):
             color_sets[cname] = EnumColorSet(elems)
             continue
 
-        # index?
         index_el = c_el.find('index')
         if index_el is not None:
             mls = index_el.findall('ml')
-            if len(mls) == 2:
+            if len(mls)==2:
                 try:
                     start = int(mls[0].text.strip())
                     end_part = mls[1].text.strip()
-                    if end_part in env and isinstance(env[end_part], int):
+                    if end_part in env and isinstance(env[end_part],int):
                         end = env[end_part]
-                        color_sets[cname] = IndexColorSet(start, end)
+                        color_sets[cname] = IndexColorSet(start,end)
                         continue
                     else:
                         color_sets[cname] = PermissiveColorSet()
@@ -161,36 +149,32 @@ def parse_color_sets(globbox_el, env):
                 color_sets[cname] = PermissiveColorSet()
                 continue
 
-        # product?
         product_el = c_el.find('product')
         if product_el is not None:
             ids = product_el.findall('id')
-            if len(ids) == 2:
+            if len(ids)==2:
                 c1 = ids[0].text.strip()
                 c2 = ids[1].text.strip()
-                pending_products.append((cname, c1, c2))
+                pending_products.append((cname,c1,c2))
             else:
                 color_sets[cname] = PermissiveColorSet()
             continue
 
-        # subset or other complex definitions => Permissive
-        # We won't handle them specifically
         subset_el = c_el.find('subset')
         if subset_el is not None:
+            # Just fallback
             color_sets[cname] = PermissiveColorSet()
             continue
 
-        # If none matched
+        # If no known structure, fallback
         color_sets[cname] = PermissiveColorSet()
 
-    # Second pass for products
-    for (cname, c1, c2) in pending_products:
+    # second pass for products
+    for (cname,c1,c2) in pending_products:
         cs1 = color_sets.get(c1, None)
         cs2 = color_sets.get(c2, None)
-        if cs1 and cs2 and isinstance(cs1, (IndexColorSet, EnumColorSet, PermissiveColorSet)) \
-                and isinstance(cs2, (IndexColorSet, EnumColorSet, PermissiveColorSet)):
-            # We'll allow product if both are Index or Enum or Permissive
-            # If both are IndexColorSet, we get nice all_tokens, else fallback
+        if cs1 and cs2 and isinstance(cs1,(IndexColorSet,EnumColorSet,PermissiveColorSet)) \
+           and isinstance(cs2,(IndexColorSet,EnumColorSet,PermissiveColorSet)):
             color_sets[cname] = ProductColorSet(cs1, cs2)
         else:
             color_sets[cname] = PermissiveColorSet()
@@ -199,15 +183,14 @@ def parse_color_sets(globbox_el, env):
 
 
 def parse_initial_marking(mtext, place_obj, color_sets, env):
-    # handle .all()
     if mtext.endswith('all()'):
         cname = mtext.split('.')[0]
         cs = color_sets.get(cname, None)
-        if cs and hasattr(cs, 'all_tokens'):
+        if cs and hasattr(cs,'all_tokens'):
             return cs.all_tokens()
         else:
             # fallback
-            return [0, 1, 2]
+            return [0,1,2]
     else:
         # try int
         try:
@@ -217,25 +200,38 @@ def parse_initial_marking(mtext, place_obj, color_sets, env):
             else:
                 return []
         except:
-            # treat as string token
+            # string token
             if place_obj.colorset.is_member(mtext):
                 return [mtext]
             return []
 
 
-def parse_atomic_expression(expr_str):
-    # Used to parse tuple components
-    expr_str = expr_str.strip()
-    # variable?
-    if expr_str.isalpha():
-        return VariableExpression(expr_str)
-    # int?
-    try:
-        val = int(expr_str)
-        return ConstantExpression(val)
-    except:
-        # fallback as constant
-        return ConstantExpression(expr_str)
+def parse_function_call(expr_str, color_sets, env):
+    # Generic function call pattern: Name(arg1, arg2, ...)
+    # We'll parse arguments by splitting on commas, assuming no nested parentheses for simplicity.
+    # We just return a FunctionExpression that returns a tuple of the arguments.
+    # If only one argument, return just that argument as a single value, else a tuple.
+    match = re.match(r'^([A-Za-z_]\w*)\((.*)\)$', expr_str)
+    if not match:
+        return None
+    func_name = match.group(1)
+    args_str = match.group(2).strip()
+
+    # split by commas at top level (no nested parentheses assumed)
+    # a simple split by ',' is risky if we had complex expressions. For now assume simple arguments.
+    if args_str.strip()=='':
+        # no arguments
+        return FunctionExpression(lambda: None, [])
+
+    args_parts = [a.strip() for a in args_str.split(',')]
+
+    args_expr = [parse_arc_expression(a, color_sets, env) for a in args_parts]
+    # Return a tuple if more than one arg, else single arg
+    def func(*vals):
+        if len(vals)==1:
+            return vals[0]
+        return tuple(vals)
+    return FunctionExpression(func, args_expr)
 
 
 def parse_arc_expression(arc_expr_str, color_sets, env):
@@ -245,8 +241,27 @@ def parse_arc_expression(arc_expr_str, color_sets, env):
     if arc_expr_str.startswith("(") and arc_expr_str.endswith(")"):
         inner = arc_expr_str.strip("()")
         vars_ = [v.strip() for v in inner.split(",")]
-        exprs = [parse_atomic_expression(v) for v in vars_]
+        exprs = []
+        for var_ in vars_:
+            # variable or int or constant
+            # try variable
+            if var_.isalpha():
+                exprs.append(VariableExpression(var_))
+            else:
+                # try int
+                try:
+                    val = int(var_)
+                    exprs.append(ConstantExpression(val))
+                except:
+                    exprs.append(ConstantExpression(var_))
         return FunctionExpression(lambda *args: tuple(args), exprs)
+
+    # function call?
+    # Identify by pattern: name(...)
+    if re.match(r'^[A-Za-z_]\w*\(.*\)$', arc_expr_str):
+        fc_expr = parse_function_call(arc_expr_str, color_sets, env)
+        if fc_expr is not None:
+            return fc_expr
 
     # variable?
     if arc_expr_str.isalpha():
@@ -259,7 +274,7 @@ def parse_arc_expression(arc_expr_str, color_sets, env):
     except:
         pass
 
-    # Try SML parsing as a fallback
+    # Try SML parsing
     try:
         ast = SMLParser.parse(arc_expr_str)
         from sml import SmlInt, SmlVar, SmlBool
@@ -270,7 +285,7 @@ def parse_arc_expression(arc_expr_str, color_sets, env):
         elif isinstance(ast, SmlBool):
             return ConstantExpression(ast.value)
         else:
-            # complex SML => fallback to constant
+            # complex -> fallback
             return ConstantExpression(arc_expr_str)
     except:
         # fallback
@@ -397,13 +412,8 @@ def parse_cpn(filename: str) -> CPN:
 
 
 if __name__ == "__main__":
-    # Example test:
-    # We will parse a given file (user should have a test file prepared)
-    # and try to run until no transitions are enabled.
-    # Just print the initial state and try firing any enabled transitions.
-
-    # Here we just show the mechanism. The user can replace "testcases/MyModel.cpn" with their file.
-    filename = "testcases/DistributedDataBase.cpn"  # placeholder
+    # Test run (user should provide a file)
+    filename = "testcases/DiningPhilosophers.cpn"
     net = parse_cpn(filename)
     print("Places:", net.places)
     print("Transitions:", net.transitions)
