@@ -7,11 +7,13 @@ class ColorSet(ABC):
     """
     Abstract base class for representing color sets.
     Color sets define the type and domain of tokens.
+    Each token placed on a place must belong to the place's associated color set.
     """
     @abstractmethod
     def is_member(self, value: Any) -> bool:
         """
         Check if a given value is a member of this color set.
+        Must be implemented by subclasses.
         """
         pass
 
@@ -19,6 +21,7 @@ class ColorSet(ABC):
 class IntegerColorSet(ColorSet):
     """
     A simple integer color set as an example.
+    Only integer values are allowed.
     """
     def is_member(self, value: Any) -> bool:
         return isinstance(value, int)
@@ -27,6 +30,7 @@ class IntegerColorSet(ColorSet):
 class StringColorSet(ColorSet):
     """
     A simple string color set as an example.
+    Only string values are allowed.
     """
     def is_member(self, value: Any) -> bool:
         return isinstance(value, str)
@@ -36,7 +40,8 @@ class Token:
     """
     Represents a colored token.
     A token has a value (of a type from its place's colorset).
-    Multiplicity is often represented in the marking itself, but we keep it here if needed.
+    Multiplicity is typically represented in the marking, not in individual tokens,
+    so this class is mostly illustrative.
     """
     def __init__(self, value: Any, multiplicity: int = 1):
         self.value = value
@@ -48,8 +53,8 @@ class Token:
 
 class Multiset:
     """
-    Represents a multiset of tokens. Internally we can use a Counter.
-    Keys will be token values, and counts their multiplicity.
+    Represents a multiset of token values using a Counter internally.
+    Each key is a token value, and the value is its multiplicity.
     """
     def __init__(self, initial=None):
         if initial is None:
@@ -57,9 +62,16 @@ class Multiset:
         self._multiset = Counter(initial)
 
     def add(self, value: Any, count: int = 1):
+        """
+        Add 'count' instances of 'value' to the multiset.
+        """
         self._multiset[value] += count
 
     def remove(self, value: Any, count: int = 1):
+        """
+        Remove 'count' instances of 'value' from the multiset.
+        Raises ValueError if there aren't enough instances.
+        """
         if self._multiset[value] < count:
             raise ValueError("Not enough tokens to remove.")
         self._multiset[value] -= count
@@ -69,14 +81,12 @@ class Multiset:
     def contains(self, other: 'Multiset') -> bool:
         """
         Check if this multiset contains at least all tokens from 'other'.
+        For each token in 'other', this multiset must have equal or greater multiplicity.
         """
         for val, cnt in other._multiset.items():
             if self._multiset[val] < cnt:
                 return False
         return True
-
-    def __repr__(self):
-        return f"Multiset({dict(self._multiset)})"
 
     def items(self):
         return self._multiset.items()
@@ -85,6 +95,9 @@ class Multiset:
         new_ms = Multiset()
         new_ms._multiset = self._multiset.copy()
         return new_ms
+
+    def __repr__(self):
+        return f"Multiset({dict(self._multiset)})"
 
 
 class Place:
@@ -103,10 +116,14 @@ class Place:
 class Expression(ABC):
     """
     Abstract base class for arc and guard expressions.
-    An expression can be evaluated given a variable binding.
+    An expression can be evaluated given a variable binding (mapping variable names to values).
     """
     @abstractmethod
     def evaluate(self, binding: Dict[str, Any]) -> Any:
+        """
+        Evaluate this expression under the given variable binding.
+        The result is a value (which can be a single token or a collection of tokens).
+        """
         pass
 
     @abstractmethod
@@ -118,10 +135,16 @@ class Expression(ABC):
 
 
 class VariableExpression(Expression):
+    """
+    An expression representing a single variable reference.
+    The variable's value is taken from the binding.
+    """
     def __init__(self, var_name: str):
         self.var_name = var_name
 
     def evaluate(self, binding: Dict[str, Any]) -> Any:
+        if self.var_name not in binding:
+            raise KeyError(f"Variable '{self.var_name}' not found in binding.")
         return binding[self.var_name]
 
     def variables(self) -> List[str]:
@@ -132,10 +155,14 @@ class VariableExpression(Expression):
 
 
 class ConstantExpression(Expression):
+    """
+    An expression representing a constant value (e.g. a number, string, or a token).
+    """
     def __init__(self, value: Any):
         self.value = value
 
     def evaluate(self, binding: Dict[str, Any]) -> Any:
+        # Constants do not depend on the binding
         return self.value
 
     def variables(self) -> List[str]:
@@ -148,11 +175,11 @@ class ConstantExpression(Expression):
 class FunctionExpression(Expression):
     """
     Represents a function or operation applied to sub-expressions.
-    For example, could be (x + 1) or a tuple construction (x, y).
+    For example, could represent arithmetic (x+1) or more complex operations.
+    func: a Python callable that takes the evaluated arguments and returns a result
+    args: list of sub-expressions whose values are computed and passed to func
     """
     def __init__(self, func, args: List[Expression]):
-        # func: a Python callable that takes a list of evaluated arguments
-        # args: list of Expressions
         self.func = func
         self.args = args
 
@@ -167,22 +194,29 @@ class FunctionExpression(Expression):
         return vars_all
 
     def __repr__(self):
-        return f"FunctionExpression({self.func.__name__}, args={self.args})"
+        # Just show the func name if possible
+        fname = self.func.__name__ if hasattr(self.func, '__name__') else str(self.func)
+        return f"FunctionExpression({fname}, args={self.args})"
 
 
 class Guard(Expression):
     """
-    A guard is essentially a boolean expression that must evaluate to True
+    A guard is a boolean expression that must evaluate to True
     for the transition to be enabled.
-    We'll inherit from Expression for uniformity, but expect a boolean result.
+    In a fully implemented system, guards would be SML expressions.
+    Here, it's treated like a normal expression expected to return True or False.
     """
     pass
 
 
 class Transition:
     """
-    Represents a transition with a name, guard, and a list of variables.
-    The variables define the domain of possible bindings that will be tested.
+    Represents a transition with:
+    - a name
+    - an optional guard (a boolean expression)
+    - a list of variables used in associated arc expressions and guards.
+
+    The variables define the domain of possible bindings tested to enable the transition.
     """
     def __init__(self, name: str, guard: Optional[Guard] = None, variables: List[str] = None):
         self.name = name
@@ -196,7 +230,8 @@ class Transition:
 class Arc:
     """
     Represents a directed arc between a place and a transition (or vice versa).
-    The expression determines which tokens are moved.
+    The expression determines which tokens are consumed (if from place to transition)
+    or produced (if from transition to place).
     """
     def __init__(self, source: Union[Place, Transition], target: Union[Place, Transition], expression: Expression):
         self.source = source
@@ -204,49 +239,77 @@ class Arc:
         self.expression = expression
 
     def __repr__(self):
+        # Show source and target names and the expression
         return f"Arc(source={self.source.name}, target={self.target.name}, expression={self.expression})"
 
 
 class CPN:
     """
-    The main class representing a Coloured Petri Net.
-    It holds places, transitions, arcs, and the initial marking.
+    Represents a Coloured Petri Net (CPN).
+
+    Attributes:
+    - places: list of Place objects
+    - transitions: list of Transition objects
+    - arcs: list of Arc objects
+    - initial_marking: a dictionary {Place: Multiset_of_values}
+
+    This class provides methods to add places, transitions, arcs, and to check enabling/firing.
     """
+
     def __init__(self):
         self.places: List[Place] = []
         self.transitions: List[Transition] = []
         self.arcs: List[Arc] = []
-        # Marking as a dict: {Place: Multiset_of_values}
         self.initial_marking: Dict[Place, Multiset] = {}
 
     def add_place(self, place: Place, initial_tokens: Optional[List[Any]] = None):
-        self.places.append(place)
+        """
+        Add a place to the net and set its initial marking.
+        Checks that each initial token belongs to the place's color set.
+        """
         if initial_tokens is None:
             initial_tokens = []
-        # Check if tokens conform to the place's colorset
+        # Validate tokens
         for token_val in initial_tokens:
             if not place.colorset.is_member(token_val):
                 raise TypeError(f"Token value {token_val} not in colorset for place {place.name}.")
+        self.places.append(place)
         self.initial_marking[place] = Multiset(initial_tokens)
 
     def add_transition(self, transition: Transition):
+        """
+        Add a transition to the net.
+        """
         self.transitions.append(transition)
 
     def add_arc(self, arc: Arc):
+        """
+        Add an arc to the net.
+        """
         self.arcs.append(arc)
 
     def get_input_arcs(self, t: Transition) -> List[Arc]:
+        """
+        Return all arcs that connect places to the given transition (input arcs).
+        """
         return [a for a in self.arcs if a.target == t and isinstance(a.source, Place)]
 
     def get_output_arcs(self, t: Transition) -> List[Arc]:
+        """
+        Return all arcs that connect the given transition to places (output arcs).
+        """
         return [a for a in self.arcs if a.source == t and isinstance(a.target, Place)]
 
     def is_enabled(self, t: Transition, binding: Dict[str, Any]) -> bool:
         """
-        Check if transition t is enabled under a given variable binding.
-        This involves:
-        1. Evaluating guard.
-        2. Checking if all input places have tokens required by input arc expressions.
+        Check if a transition 't' is enabled under the given variable binding.
+
+        Steps:
+        1. Evaluate guard. If guard is present and not True, return False.
+        2. For each input arc, evaluate the arc expression under 'binding'.
+           Check if the required tokens are present in the input place.
+           If any required token multiset is not available, return False.
+        If all checks pass, return True.
         """
         # Check guard
         if t.guard:
@@ -257,13 +320,18 @@ class CPN:
         # Check input arcs
         for arc in self.get_input_arcs(t):
             req_tokens = arc.expression.evaluate(binding)
-            # req_tokens could be a single value or a collection.
-            # We'll assume a single token value or a list of token values.
-            # Convert to a multiset:
+
+            # Convert to a multiset
+            # Arc expression can return a single value or a collection
             if isinstance(req_tokens, list):
+                needed = Multiset(req_tokens)
+            elif isinstance(req_tokens, tuple):
+                # A tuple also can represent multiple tokens
                 needed = Multiset(req_tokens)
             else:
                 needed = Multiset([req_tokens])
+
+            # Check availability in the marking
             if not self.initial_marking[arc.source].contains(needed):
                 return False
 
@@ -271,13 +339,18 @@ class CPN:
 
     def fire_transition(self, t: Transition, binding: Dict[str, Any]):
         """
-        Fire the transition t under the given binding.
-        This removes tokens from input places and adds tokens to output places.
+        Fire the transition 't' under the given binding.
+        This updates the marking according to the occurrence rule:
+        - Remove tokens from input places as defined by input arcs' expressions.
+        - Add tokens to output places as defined by output arcs' expressions.
+
+        Raises ValueError if there aren't enough tokens to remove.
+        Raises TypeError if produced tokens don't match the target place's color set.
         """
         # Remove tokens from input places
         for arc in self.get_input_arcs(t):
             req_tokens = arc.expression.evaluate(binding)
-            if isinstance(req_tokens, list):
+            if isinstance(req_tokens, list) or isinstance(req_tokens, tuple):
                 needed = Multiset(req_tokens)
             else:
                 needed = Multiset([req_tokens])
@@ -288,13 +361,13 @@ class CPN:
         # Add tokens to output places
         for arc in self.get_output_arcs(t):
             prod_tokens = arc.expression.evaluate(binding)
-            if isinstance(prod_tokens, list):
+            if isinstance(prod_tokens, list) or isinstance(prod_tokens, tuple):
                 prod = Multiset(prod_tokens)
             else:
                 prod = Multiset([prod_tokens])
 
             for val, cnt in prod.items():
-                # Check that val is member of the place's colorset
+                # Check colorset compliance
                 if not arc.target.colorset.is_member(val):
                     raise TypeError(f"Produced token {val} not in colorset of place {arc.target.name}")
                 self.initial_marking[arc.target].add(val, cnt)
@@ -314,21 +387,18 @@ if __name__ == "__main__":
 
     # Arc expressions: from P to T: a variable expression 'x'
     # from T to P: a function expression 'x+1'
-    # Let's define variables and guard:
     var_x = VariableExpression("x")
     inc_x = FunctionExpression(lambda a: a+1, [var_x])  # x+1
 
     # Create a small net
     net = CPN()
-    net.add_place(p, initial_tokens=[0])  # Marking: P has one token with value 0
-    t.variables = ["x"]  # transition variable
+    net.add_place(p, initial_tokens=[0])  # P has one token: 0
+    t.variables = ["x"]  # The transition T uses variable x
     net.add_transition(t)
 
-    # Input arc: P -> T
-    arc_in = Arc(p, t, var_x)
-    # Output arc: T -> P
-    arc_out = Arc(t, p, inc_x)
-
+    # Add arcs
+    arc_in = Arc(p, t, var_x)    # consumes x from P
+    arc_out = Arc(t, p, inc_x)   # produces x+1 to P
     net.add_arc(arc_in)
     net.add_arc(arc_out)
 
@@ -340,3 +410,7 @@ if __name__ == "__main__":
         print("After firing:", net.initial_marking)
     else:
         print("Transition T is not enabled with x=0.")
+
+    # This example is straightforward. In more complex scenarios,
+    # you would have to integrate a proper SML interpreter and full color set
+    # definitions to correctly model the behavior of real-world CPN models.
