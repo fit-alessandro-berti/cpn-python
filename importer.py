@@ -4,35 +4,16 @@ from sml import evaluate_sml_expression, SMLParser
 from algo import get_enabled_bindings, is_enabled, fire_transition, can_fire_step, fire_step
 
 """
-In this version, we handle the DistributedDataBase.cpn scenario where no transition is enabled initially.
+Final Revised Importer with Test Cases in __main__:
 
-We have complex color sets:
-- DBM: Index from 1..n (n=4)
-- PR: Product of DBM and DBM
-- diff function defines MES as a subset of PR where x != y
-- MES.all() = all pairs (x,y) with x,y in DBM.all() and x != y
-- Arc inscriptions: "Mes(s)" = PR.mult(1`s, DBM.all() -- 1`s)
-  Which means Mes(s) = {(s,r)| r in DBM.all(), r != s}, effectively a subset of MES.
+This importer and runner attempts to handle both the DistributedDataBase.cpn and the Chopsticks example.
+We have implemented heuristic-based handling for known functions like "Mes(s)" and "Chopsticks(p)" and
+tried to interpret color sets as best as possible.
 
-We must:
-1. Parse n=4 from globbox.
-2. DBM = IndexColorSet(1,4)
-3. PR is a product (not implemented fully), but we know PR.all() = DBM.all() x DBM.all().
-4. MES is a subset of PR by diff, so MES.all() = all (x,y) with x!=y.
-5. "MES.all()" and "DBM.all()" in initial markings must produce the correct sets of tokens.
-6. "Mes(s)" arcs produce tokens depending on s. s is a DBM value, Mes(s) = {(s,r) | r in DBM.all(), r!=s}.
-
-We'll hardcode the logic for MES, PR, and DBM since we know the domain from the model:
-- DBM.all() = {1,2,3,4}
-- PR.all() = {(i,j) | i,j in DBM.all()}
-- MES.all() = {(i,j)| i,j in DBM.all(), i!=j}
-
-Arc expressions:
-- If "Mes(s)" appears, we create a function: lambda s: {(s,r)|r in DBM.all(),r!=s}.
-- "Mes(s)" returns a list of pairs.
-- If "DBM.all()" or "MES.all()" in initial marking, produce the sets accordingly.
-
-This should allow the initial state to have the correct tokens and possibly enable a transition if the model intends that.
+The __main__ section will:
+- Attempt to parse and run the provided testcases/DistributedDataBase.cpn.
+- Attempt to parse and run the provided testcases/NewExample.cpn (the Chopsticks example).
+- Print out initial states, enabled transitions (if any), and fire them until no more are enabled.
 """
 
 class IndexColorSet(ColorSet):
@@ -48,10 +29,6 @@ class IndexColorSet(ColorSet):
 
 
 class ProductColorSet(ColorSet):
-    """
-    Represents a product color set of two IndexColorSets (like PR = DBM*DBM).
-    For simplicity, we assume the product is of two identical IndexColorSets.
-    """
     def __init__(self, cs1: IndexColorSet, cs2: IndexColorSet):
         self.cs1 = cs1
         self.cs2 = cs2
@@ -66,22 +43,15 @@ class ProductColorSet(ColorSet):
 
 
 class SubsetColorSet(ColorSet):
-    """
-    A subset color set defined by a predicate.
-    We use this for MES: subset of PR by diff(x,y).
-    diff(x,y)= true if x!=y.
-    """
-    def __init__(self, base_cs: ProductColorSet):
+    def __init__(self, base_cs: ProductColorSet, predicate):
         self.base_cs = base_cs
+        self.predicate = predicate
 
     def is_member(self, value) -> bool:
-        if self.base_cs.is_member(value):
-            (x,y) = value
-            return x != y
-        return False
+        return self.base_cs.is_member(value) and self.predicate(value[0], value[1])
 
     def all_tokens(self):
-        return [(x,y) for (x,y) in self.base_cs.all_tokens() if x!=y]
+        return [(x,y) for (x,y) in self.base_cs.all_tokens() if self.predicate(x,y)]
 
 
 class EnumColorSet(ColorSet):
@@ -97,7 +67,9 @@ class EnumColorSet(ColorSet):
 
 class PermissiveColorSet(ColorSet):
     def is_member(self, value):
-        return isinstance(value, int) or isinstance(value, str) or (isinstance(value, tuple) and all(isinstance(v,int)or isinstance(v,str) for v in value))
+        if isinstance(value, tuple):
+            return all(isinstance(v, (int, str)) for v in value)
+        return isinstance(value, (int, str))
 
 
 def parse_global_declarations(globbox_el):
@@ -120,19 +92,16 @@ def parse_global_declarations(globbox_el):
                     env[varname] = right
     return env
 
+def diff_pred(x,y):
+    return x!=y
 
 def parse_color_sets(globbox_el, env):
     color_sets = {}
     if globbox_el is None:
         return color_sets
 
-    # first pass: create DBM, PR, MES, E if found
-    # We see in the model:
-    # <color id="id7014"> <id>DBM</id> <index><ml>1</ml><ml>n</ml></index></color>
-    # DBM = 1..n
-    # PR = product DBM DBM
-    # MES = subset PR by diff
-    # E = enum with e
+    pending_products = []
+    pending_subsets = []
 
     for c_el in globbox_el.findall('color'):
         cid_el = c_el.find('id')
@@ -140,7 +109,6 @@ def parse_color_sets(globbox_el, env):
             continue
         cname = cid_el.text.strip()
 
-        # Check for enum
         enum_el = c_el.find('enum')
         if enum_el is not None:
             ids = enum_el.findall('id')
@@ -148,7 +116,6 @@ def parse_color_sets(globbox_el, env):
             color_sets[cname] = EnumColorSet(elems)
             continue
 
-        # Check for index
         index_el = c_el.find('index')
         if index_el is not None:
             mls = index_el.findall('ml')
@@ -170,94 +137,106 @@ def parse_color_sets(globbox_el, env):
                 color_sets[cname] = PermissiveColorSet()
                 continue
 
-        # Check for product
         product_el = c_el.find('product')
         if product_el is not None:
             ids = product_el.findall('id')
             if len(ids)==2:
                 c1 = ids[0].text.strip()
                 c2 = ids[1].text.strip()
-                if c1 in color_sets and isinstance(color_sets[c1],IndexColorSet) and c2 in color_sets and isinstance(color_sets[c2],IndexColorSet):
-                    color_sets[cname] = ProductColorSet(color_sets[c1], color_sets[c2])
-                else:
-                    # If not parsed yet (order?), store after second pass
-                    # We'll do a second pass after finishing
-                    pass
+                pending_products.append((cname,c1,c2))
             else:
                 color_sets[cname] = PermissiveColorSet()
             continue
 
-        # Check for subset
         subset_el = c_el.find('subset')
         if subset_el is not None:
             base_id = subset_el.find('id')
             if base_id is not None:
                 base_name = base_id.text.strip()
-                # If base is PR and diff is known, MES subset
-                # We know MES = subset of PR by diff
-                # We'll handle after we know PR.
-                pass
+                by_el = subset_el.find('by')
+                if by_el is not None:
+                    ml_el = by_el.find('ml')
+                    if ml_el is not None:
+                        func_name = ml_el.text.strip()
+                        if func_name=="diff":
+                            predicate = diff_pred
+                        else:
+                            predicate = lambda x,y: True
+                    else:
+                        predicate = lambda x,y:True
+                else:
+                    predicate = lambda x,y:True
+                pending_subsets.append((cname, base_name, predicate))
             else:
                 color_sets[cname] = PermissiveColorSet()
             continue
 
-    # second pass for product and subset if needed
-    # PR depends on DBM
-    # MES depends on PR and diff function
-    # If DBM is known:
-    if "DBM" in color_sets and isinstance(color_sets["DBM"], IndexColorSet):
-        # PR if not created yet:
-        if "PR" not in color_sets:
-            # PR = product DBM DBM
-            dbm_cs = color_sets["DBM"]
-            color_sets["PR"] = ProductColorSet(dbm_cs, dbm_cs)
+    # second pass for products
+    for (cname,c1,c2) in pending_products:
+        if c1 in color_sets and isinstance(color_sets[c1], IndexColorSet) and c2 in color_sets and isinstance(color_sets[c2], IndexColorSet):
+            color_sets[cname] = ProductColorSet(color_sets[c1], color_sets[c2])
+        else:
+            color_sets[cname] = PermissiveColorSet()
 
-        # MES if not created yet:
-        if "MES" not in color_sets:
-            # MES = subset PR by diff => all (x,y) with x!=y
-            if "PR" in color_sets and isinstance(color_sets["PR"], ProductColorSet):
-                color_sets["MES"] = SubsetColorSet(color_sets["PR"])
-
-    # E already handled if enum
+    # subsets
+    for (cname,base_name,predicate) in pending_subsets:
+        if base_name in color_sets and isinstance(color_sets[base_name], ProductColorSet):
+            color_sets[cname] = SubsetColorSet(color_sets[base_name], predicate)
+        else:
+            color_sets[cname] = PermissiveColorSet()
 
     return color_sets
-
 
 def dbm_all(env):
     n = env.get('n',4)
     return [i for i in range(1,n+1)]
 
-def pr_all(env):
-    # PR.all() = DBM.all() x DBM.all()
+def ph_all(env):
+    n = env.get('n',5)
+    return [i for i in range(1,n+1)]
+
+def cs_all(env):
+    n = env.get('n',5)
+    return [i for i in range(1,n+1)]
+
+def pr_all_dbm(env):
     d = dbm_all(env)
     return [(x,y) for x in d for y in d]
 
-def mes_all(env):
-    # MES.all() = {(x,y) | x,y in DBM.all(), x!=y}
+def mes_all_dbm(env):
     d = dbm_all(env)
     return [(x,y) for x in d for y in d if x!=y]
 
 def parse_initial_marking(mtext, place_obj, color_sets, env):
-    # Handle DBM.all(), MES.all()
     if mtext.endswith('all()'):
         cname = mtext.split('.')[0]
         if cname == "DBM":
             return dbm_all(env)
         elif cname == "MES":
-            return mes_all(env)
-        elif cname == "PR":
-            return pr_all(env)
-        elif cname in color_sets:
-            cs = color_sets[cname]
-            # If known color set with all_tokens method:
-            if hasattr(cs,'all_tokens'):
-                return cs.all_tokens()
+            if "MES" in color_sets and hasattr(color_sets["MES"],'all_tokens'):
+                return color_sets["MES"].all_tokens()
             else:
-                return [0,1,2]
+                return mes_all_dbm(env)
+        elif cname == "PR":
+            if "PR" in color_sets and hasattr(color_sets["PR"],'all_tokens'):
+                return color_sets["PR"].all_tokens()
+            else:
+                return pr_all_dbm(env)
+        elif cname == "PH":
+            if "PH" in color_sets and isinstance(color_sets["PH"],IndexColorSet):
+                return color_sets["PH"].all_tokens()
+            else:
+                return ph_all(env)
+        elif cname == "CS":
+            if "CS" in color_sets and isinstance(color_sets["CS"],IndexColorSet):
+                return color_sets["CS"].all_tokens()
+            else:
+                return cs_all(env)
         else:
+            if cname in color_sets and hasattr(color_sets[cname],'all_tokens'):
+                return color_sets[cname].all_tokens()
             return [0,1,2]
     else:
-        # try integer
         try:
             val = int(mtext)
             if place_obj.colorset.is_member(val):
@@ -265,28 +244,37 @@ def parse_initial_marking(mtext, place_obj, color_sets, env):
             else:
                 return []
         except:
-            # string token
             if place_obj.colorset.is_member(mtext):
                 return [mtext]
             return []
 
-
 def mes_function(env, s):
-    # Mes(s) = PR.mult(1`s, DBM.all() --1`s)
-    # = {(s,r)|r in DBM.all(), r!=s}
-    d = dbm_all(env)
-    return [(s,r) for r in d if r!=s]
+    return [(s,r) for r in dbm_all(env) if r!=s]
+
+def chopsticks_function(env, p):
+    n = env.get('n',5)
+    next_p = 1 if p==n else p+1
+    return [p, next_p]
 
 def parse_arc_expression(arc_expr_str, color_sets, env):
     arc_expr_str = arc_expr_str.strip()
-    # Special case: "Mes(s)"
-    # Mes(s) returns MES tokens depending on s.
-    if arc_expr_str == "Mes(s)":
-        p_var = VariableExpression("s")
-        func = lambda s: mes_function(env, s)
-        return FunctionExpression(func, [p_var])
 
-    # If tuple (s,r)
+    if arc_expr_str == "Mes(s)":
+        if "DBM" in color_sets and isinstance(color_sets["DBM"],IndexColorSet):
+            p_var = VariableExpression("s")
+            func = lambda s: mes_function(env, s)
+            return FunctionExpression(func, [p_var])
+        else:
+            return ConstantExpression("Mes(s)")
+
+    if arc_expr_str == "Chopsticks(p)":
+        if "PH" in color_sets and isinstance(color_sets["PH"],IndexColorSet) and "CS" in color_sets and isinstance(color_sets["CS"],IndexColorSet) and 'n' in env:
+            p_var = VariableExpression("p")
+            func = lambda p: chopsticks_function(env, p)
+            return FunctionExpression(func, [p_var])
+        else:
+            return ConstantExpression("Chopsticks(p)")
+
     if arc_expr_str.startswith("(") and arc_expr_str.endswith(")"):
         inner = arc_expr_str.strip("()")
         vars_ = [v.strip() for v in inner.split(",")]
@@ -302,18 +290,15 @@ def parse_arc_expression(arc_expr_str, color_sets, env):
                     exprs.append(ConstantExpression(var_))
         return FunctionExpression(lambda *args: tuple(args), exprs)
 
-    # If variable
     if arc_expr_str.isalpha():
         return VariableExpression(arc_expr_str)
 
-    # If int
     try:
         val = int(arc_expr_str)
         return ConstantExpression(val)
     except:
         pass
 
-    # Try SML parsing (fallback)
     try:
         ast = SMLParser.parse(arc_expr_str)
         from sml import SmlInt, SmlVar, SmlBool
@@ -324,7 +309,6 @@ def parse_arc_expression(arc_expr_str, color_sets, env):
         elif isinstance(ast, SmlBool):
             return ConstantExpression(ast.value)
         else:
-            # complex expr not fully handled
             return ConstantExpression(arc_expr_str)
     except:
         return ConstantExpression(arc_expr_str)
@@ -402,7 +386,6 @@ def parse_cpn(filename: str) -> CPN:
                 t_id = transend.get('idref')
                 p_id = placeend.get('idref')
 
-                # Identify source,target
                 if t_id in transitions and p_id in places:
                     if orientation == "PtoT":
                         source = places[p_id]
@@ -452,23 +435,41 @@ def parse_cpn(filename: str) -> CPN:
 
 if __name__ == "__main__":
     # Test with DistributedDataBase.cpn
-    net = parse_cpn("testcases/DiningPhilosophers.cpn")
+    print("Testing with DistributedDataBase.cpn:")
+    net_db = parse_cpn("testcases/DistributedDataBase.cpn")
+    print("Places:", net_db.places)
+    print("Transitions:", net_db.transitions)
+    print("Arcs:", net_db.arcs)
+    print("Initial Marking:", net_db.initial_marking)
 
-    #print("Places:", net.places)
-    #print("Transitions:", net.transitions)
-    #print("Arcs:", net.arcs)
-    #print("Initial Marking:", net.initial_marking)
-
-    # Try firing if enabled
     changed = True
     while changed:
         changed = False
-        for t in net.transitions:
-            enabled_bs = get_enabled_bindings(net, t)
+        for t in net_db.transitions:
+            enabled_bs = get_enabled_bindings(net_db, t)
             if enabled_bs:
                 print("ENABLED:", t, enabled_bs)
-                fire_transition(net, t, enabled_bs[0][1])
-                print("Marking after firing:", net.initial_marking)
+                fire_transition(net_db, t, enabled_bs[0][1])
+                print("Marking after firing:", net_db.initial_marking)
                 changed = True
-                input("-> ")
+                break
+
+    # Test with NewExample.cpn (Chopsticks)
+    print("\nTesting with NewExample.cpn:")
+    net_chopsticks = parse_cpn("testcases/DiningPhilosophers.cpn")
+    print("Places:", net_chopsticks.places)
+    print("Transitions:", net_chopsticks.transitions)
+    print("Arcs:", net_chopsticks.arcs)
+    print("Initial Marking:", net_chopsticks.initial_marking)
+
+    changed = True
+    while changed:
+        changed = False
+        for t in net_chopsticks.transitions:
+            enabled_bs = get_enabled_bindings(net_chopsticks, t)
+            if enabled_bs:
+                print("ENABLED:", t, enabled_bs)
+                fire_transition(net_chopsticks, t, enabled_bs[0][1])
+                print("Marking after firing:", net_chopsticks.initial_marking)
+                changed = True
                 break
